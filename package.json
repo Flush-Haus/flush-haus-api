@@ -1,0 +1,19 @@
+{
+  "dependencies": {
+    "elysia": "latest"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.16",
+    "bun-types": "latest",
+    "ultracite": "7.8.3"
+  },
+  "name": "poker",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "bun run --watch src/index.ts",
+    "check": "ultracite check",
+    "fix": "ultracite fix"
+  },
+  "version": "1.0.50",
+  "module": "src/index.js"
+}
