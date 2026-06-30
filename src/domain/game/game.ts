@@ -1,9 +1,9 @@
-import { RoundState } from "../../utils/constants";
-import type { Card } from "../cards/card";
+import type { Card } from "@/domain/cards/card";
+import { RoundState } from "@/utils/constants";
 
 export interface Pot {
   amount: number;
-  eligiblePlayers: Set<string>;
+  eligible: string[];
   type: "MAIN" | "SIDE";
 }
 
@@ -14,8 +14,9 @@ export class Game {
   communityCards: Card[] = [];
   pots: Pot[] = [];
   bets: Map<string, number> = new Map();
-
-  actingPlayerId?: string;
+  currentBet = 0;
+  dealerOffset = 0;
+  actingPlayerId = "";
 
   constructor(sessionId: string, deck: Card[]) {
     this.sessionId = sessionId;

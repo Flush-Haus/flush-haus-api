@@ -1,8 +1,8 @@
-import type { Card } from "../domain/cards/card";
-import { createDeck, shuffleDeck } from "../domain/cards/deck";
-import { Game } from "../domain/game/game";
-import { evaluateHand } from "../domain/poker/handEvaluator";
-import type { Session } from "../domain/session/session";
+import type { Card } from "@/domain/cards/card";
+import { createDeck, shuffleDeck } from "@/domain/cards/deck";
+import { Game, type Pot } from "@/domain/game/game";
+import { evaluateHand } from "@/domain/poker/hand-evaluator";
+import type { Session } from "@/domain/session/session";
 import {
   serializeAction,
   serializeBoardFlop,
@@ -16,18 +16,12 @@ import {
   serializeResult,
   serializeRoundStart,
   serializeTurn,
-} from "../protocol/serializer/gameSerializer";
-import { PlayerState, RoundState, SessionState } from "../utils/constants";
+} from "@/protocol/serializer/game-serializer";
+import { PlayerState, RoundState, SessionState } from "@/utils/constants";
 
-/**
- * GameService orchestrates the poker flow for a session.
- * It manages the deck, bets, pots, community cards, turn order, and hand evaluation.
- * The implementation follows the textual protocol defined in PROTOCOLO.md.
- */
 class GameService {
-  private readonly games: Map<string, Game> = new Map(); // keyed by session ID
+  private readonly games: Map<string, Game> = new Map();
 
-  // ---------- Game lifecycle ----------
   initGame(session: Session): Game {
     const deck = shuffleDeck(createDeck());
     const game = new Game(session.id, deck);
@@ -39,36 +33,57 @@ class GameService {
     return this.games.get(sessionId);
   }
 
-  // ---------- Information ----------
   broadcastGameInfo(session: Session): void {
     const players = Array.from(session.players.values()).map((p) => ({
       id: p.id,
       chips: p.chips,
     }));
     const msg = serializeGameInfo(players);
-    session.players.forEach((p) => p.ws?.send(msg));
+    for (const p of session.players.values()) {
+      p.ws?.send(msg);
+    }
   }
 
-  // ---------- Round handling ----------
   startRound(session: Session): void {
     const game = this.getGame(session.id) ?? this.initGame(session);
-    // Deal two private cards to each player (hole cards)
+    // Reset game state for a new round
+    game.communityCards = [];
+    game.pots = [];
+    game.bets = new Map();
+    game.currentBet = 0;
+    game.round = RoundState.PreFlop;
+    game.dealerOffset++;
+
+    // Activate eligible players for the new round
     for (const player of session.players.values()) {
+      if (player.state === PlayerState.Connected) {
+        player.state = PlayerState.Active;
+      }
+    }
+
+    // Deal two private cards to each eligible player
+    for (const player of session.players.values()) {
+      if (
+        player.state === PlayerState.Eliminated ||
+        player.state === PlayerState.Waiting
+      ) {
+        continue;
+      }
       const card1 = game.deck.shift();
       const card2 = game.deck.shift();
       if (card1 && card2) {
         player.holeCards = [card1, card2];
-        // Send private hole cards to the player only
         const holeMsg = `game hole ${card1.value}${card1.suit} ${card2.value}${card2.suit}`;
         player.ws?.send(holeMsg);
       }
     }
 
-    // Determine dealer, small blind, big blind (rotate simple order)
+    // Determine dealer, SB, BB with rotation
     const playerIds = Array.from(session.players.keys());
-    const dealerId = playerIds[0];
-    const smallBlindId = playerIds[1 % playerIds.length];
-    const bigBlindId = playerIds[2 % playerIds.length];
+    const offset = game.dealerOffset % playerIds.length;
+    const dealerId = playerIds[offset];
+    const smallBlindId = playerIds[(offset + 1) % playerIds.length];
+    const bigBlindId = playerIds[(offset + 2) % playerIds.length];
     const seatAssignments = playerIds.map((pid, idx) => ({
       position: idx,
       playerId: pid,
@@ -83,26 +98,29 @@ class GameService {
       playerIds.length,
       seatAssignments
     );
-    session.players.forEach((p) => p.ws?.send(roundStartMsg));
+    for (const p of session.players.values()) {
+      p.ws?.send(roundStartMsg);
+    }
 
-    // Initialize betting state
-    game.bets = new Map();
-    game.currentBet = 0;
-    game.actingPlayerId = smallBlindId; // first action after blinds
     // Post blinds automatically
     this.postBlind(session, smallBlindId, session.smallBlind);
     this.postBlind(session, bigBlindId, session.bigBlind);
-    // Notify turn for the player after big blind
-    const nextPlayerId = this.nextActingPlayer(session, game.actingPlayerId);
-    game.actingPlayerId = nextPlayerId;
+
+    // In pre-flop, first action is UTG (player after big blind)
+    game.actingPlayerId = bigBlindId;
+    const firstToAct = this.nextActingPlayer(session, bigBlindId);
+    game.actingPlayerId = firstToAct;
+
     const turnMsg = serializeTurn(
-      nextPlayerId,
+      firstToAct,
       session.bigBlind,
       session.bigBlind * 2,
       session.bigBlind * 4,
       15_000
     );
-    session.players.forEach((p) => p.ws?.send(turnMsg));
+    for (const p of session.players.values()) {
+      p.ws?.send(turnMsg);
+    }
   }
 
   private postBlind(session: Session, playerId: string, amount: number): void {
@@ -110,24 +128,27 @@ class GameService {
     if (!player) {
       return;
     }
-    player.chips -= amount;
-    player.state = PlayerState.Active;
+    const blindAmount = Math.min(amount, player.chips);
+    player.chips -= blindAmount;
+    player.state =
+      blindAmount < amount ? PlayerState.AllIn : PlayerState.Active;
     const game = this.getGame(session.id);
     if (game) {
-      game.bets.set(playerId, amount);
-      game.currentBet = Math.max(game.currentBet, amount);
+      game.bets.set(playerId, blindAmount);
+      game.currentBet = Math.max(game.currentBet, blindAmount);
     }
     const actionMsg = serializeAction(
       playerId,
       "blind",
-      amount,
-      amount,
+      blindAmount,
+      blindAmount,
       player.chips
     );
-    session.players.forEach((p) => p.ws?.send(actionMsg));
+    for (const p of session.players.values()) {
+      p.ws?.send(actionMsg);
+    }
   }
 
-  // ---------- Action handling ----------
   handleAction(
     session: Session,
     playerId: string,
@@ -137,6 +158,11 @@ class GameService {
     const player = session.players.get(playerId);
     const game = this.getGame(session.id);
     if (!(player && game)) {
+      return;
+    }
+
+    // Reject out-of-turn actions
+    if (playerId !== game.actingPlayerId) {
       return;
     }
 
@@ -150,8 +176,9 @@ class GameService {
       case "call": {
         const toCall = game.currentBet - (game.bets.get(playerId) ?? 0);
         const callAmt = Math.min(toCall, player.chips);
+        const isAllIn = callAmt >= player.chips;
         player.chips -= callAmt;
-        player.state = PlayerState.Active;
+        player.state = isAllIn ? PlayerState.AllIn : PlayerState.Active;
         game.bets.set(playerId, (game.bets.get(playerId) ?? 0) + callAmt);
         break;
       }
@@ -164,14 +191,15 @@ class GameService {
         break;
       }
       case "raise": {
-        const toCall = game.currentBet - (game.bets.get(playerId) ?? 0);
-        const raiseTotal = toCall + amount; // amount is raise-to total
-        const raiseAmt = Math.min(raiseTotal, player.chips);
-        player.chips -= raiseAmt;
+        const alreadyIn = game.bets.get(playerId) ?? 0;
+        const totalTarget = amount;
+        const addAmount = Math.max(0, totalTarget - alreadyIn);
+        const addAmt = Math.min(addAmount, player.chips);
+        player.chips -= addAmt;
         player.state = PlayerState.Active;
-        const newBet = (game.bets.get(playerId) ?? 0) + raiseAmt;
+        const newBet = alreadyIn + addAmt;
         game.bets.set(playerId, newBet);
-        game.currentBet = newBet;
+        game.currentBet = Math.max(game.currentBet, newBet);
         break;
       }
       case "all_in": {
@@ -179,16 +207,13 @@ class GameService {
         player.chips = 0;
         player.state = PlayerState.AllIn;
         game.bets.set(playerId, (game.bets.get(playerId) ?? 0) + allInAmt);
-        // currentBet may stay the same if allInAmt < currentBet, side pot will be created later
         break;
       }
       default:
-        // unknown action – ignore
         return;
     }
 
     // Broadcast the performed action
-    const _totalBet = game.bets.get(playerId) ?? 0;
     const potTotal = Array.from(game.bets.values()).reduce((a, b) => a + b, 0);
     const actionMsg = serializeAction(
       playerId,
@@ -197,15 +222,15 @@ class GameService {
       potTotal,
       player.chips
     );
-    session.players.forEach((p) => p.ws?.send(actionMsg));
+    for (const p of session.players.values()) {
+      p.ws?.send(actionMsg);
+    }
 
     // Determine next acting player
     const nextId = this.nextActingPlayer(session, game.actingPlayerId);
     game.actingPlayerId = nextId;
-    // If betting round is finished, compute pots and advance round
     if (this.isBettingRoundComplete(session, game)) {
       this.computePots(session);
-      // Reset bets for next round
       game.bets.clear();
       game.currentBet = 0;
       this.advanceRound(session);
@@ -217,16 +242,20 @@ class GameService {
         game.currentBet * 4,
         15_000
       );
-      session.players.forEach((p) => p.ws?.send(turnMsg));
+      for (const p of session.players.values()) {
+        p.ws?.send(turnMsg);
+      }
     }
   }
 
   private isBettingRoundComplete(session: Session, game: Game): boolean {
-    // Betting round ends when every player who is still active has either matched the current bet or is all‑in/folded
     for (const player of session.players.values()) {
       if (
         player.state === PlayerState.Folded ||
-        player.state === PlayerState.AllIn
+        player.state === PlayerState.AllIn ||
+        player.state === PlayerState.Eliminated ||
+        player.state === PlayerState.Waiting ||
+        player.state === PlayerState.Disconnected
       ) {
         continue;
       }
@@ -238,7 +267,6 @@ class GameService {
     return true;
   }
 
-  // ---------- Pot calculation ----------
   computePots(session: Session): void {
     const game = this.getGame(session.id);
     if (!game) {
@@ -249,7 +277,7 @@ class GameService {
       return;
     }
     betEntries.sort((a, b) => a[1] - b[1]);
-    const pots: { type: string; amount: number; eligible: string[] }[] = [];
+    const pots: Pot[] = [];
     let prev = 0;
     const remaining = new Set<string>(betEntries.map((e) => e[0]));
     for (const [pid, bet] of betEntries) {
@@ -263,11 +291,13 @@ class GameService {
       }
       remaining.delete(pid);
     }
+    game.pots = pots;
     const serialized = serializePots(pots);
-    session.players.forEach((p) => p.ws?.send(serialized));
+    for (const p of session.players.values()) {
+      p.ws?.send(serialized);
+    }
   }
 
-  // ---------- Round progression ----------
   private advanceRound(session: Session): void {
     const game = this.getGame(session.id);
     if (!game) {
@@ -291,15 +321,18 @@ class GameService {
       case RoundState.Showdown:
         this.handleShowdown(session, game);
         break;
+      case RoundState.Finished:
+        break;
       default:
         break;
     }
-    // If not showdown, start next betting turn
-    if (next !== RoundState.Showdown) {
+    if (next !== RoundState.Showdown && next !== RoundState.Finished) {
       const firstActive = this.firstActivePlayer(session);
       game.actingPlayerId = firstActive;
       const turnMsg = serializeTurn(firstActive, 0, 0, 0, 15_000);
-      session.players.forEach((p) => p.ws?.send(turnMsg));
+      for (const p of session.players.values()) {
+        p.ws?.send(turnMsg);
+      }
     }
   }
 
@@ -313,6 +346,8 @@ class GameService {
         return RoundState.River;
       case RoundState.River:
         return RoundState.Showdown;
+      case RoundState.Showdown:
+        return RoundState.Finished;
       default:
         return current;
     }
@@ -341,7 +376,9 @@ class GameService {
       this.cardToString(flop[1]),
       this.cardToString(flop[2])
     );
-    session.players.forEach((p) => p.ws?.send(msg));
+    for (const p of session.players.values()) {
+      p.ws?.send(msg);
+    }
   }
 
   private broadcastBoardTurn(session: Session, game: Game): void {
@@ -350,7 +387,9 @@ class GameService {
       return;
     }
     const msg = serializeBoardTurn(this.cardToString(card));
-    session.players.forEach((p) => p.ws?.send(msg));
+    for (const p of session.players.values()) {
+      p.ws?.send(msg);
+    }
   }
 
   private broadcastBoardRiver(session: Session, game: Game): void {
@@ -359,7 +398,9 @@ class GameService {
       return;
     }
     const msg = serializeBoardRiver(this.cardToString(card));
-    session.players.forEach((p) => p.ws?.send(msg));
+    for (const p of session.players.values()) {
+      p.ws?.send(msg);
+    }
   }
 
   private firstActivePlayer(session: Session): string {
@@ -368,8 +409,7 @@ class GameService {
         return p.id;
       }
     }
-    // fallback to any player
-    return session.players.keys().next().value ?? "";
+    return "";
   }
 
   private nextActingPlayer(session: Session, currentId: string): string {
@@ -381,52 +421,78 @@ class GameService {
       if (!player) {
         continue;
       }
-      if (player.state === PlayerState.Active) {
+      if (
+        player.state === PlayerState.Active ||
+        player.state === PlayerState.Connected
+      ) {
         return candidate;
       }
     }
-    return ids[0];
+    return currentId;
   }
 
-  // ---------- Showdown handling ----------
   private handleShowdown(session: Session, game: Game): void {
-    // Send each player's hole cards privately (already sent earlier, but protocol expects them during showdown as well)
-    session.players.forEach((p) => {
+    this.broadcastHoleCards(session);
+    const { winners, winAmount } = this.evaluateAndDistribute(session, game);
+    this.broadcastResultAndChips(session, winners, winAmount);
+    this.eliminatePlayers(session);
+    this.checkGameOver(session);
+  }
+
+  private broadcastHoleCards(session: Session): void {
+    for (const p of session.players.values()) {
       if (p.holeCards.length === 2) {
         const holeMsg = `game hole ${this.cardToString(p.holeCards[0])} ${this.cardToString(p.holeCards[1])}`;
         p.ws?.send(holeMsg);
       }
-    });
+    }
+  }
 
-    // Evaluate hands and determine winner(s)
+  private evaluateAndDistribute(
+    session: Session,
+    game: Game
+  ): { winners: { playerId: string; rank: string }[]; winAmount: number } {
     const handRanks: { playerId: string; rank: string; handValue: number }[] =
       [];
     for (const p of session.players.values()) {
+      if (p.holeCards.length !== 2) {
+        continue;
+      }
       const rank = evaluateHand(p.holeCards, game.communityCards);
       const handValue = this.rankValue(rank);
       handRanks.push({ playerId: p.id, rank, handValue });
     }
-    // Find max hand value
     const maxValue = Math.max(...handRanks.map((h) => h.handValue));
     const winners = handRanks.filter((h) => h.handValue === maxValue);
 
-    // Simple pot distribution: give whole pot to each winner equally (no side‑pot logic here – already broadcast earlier)
     const totalPot = game.pots.reduce((sum, pot) => sum + pot.amount, 0);
     const winAmount = Math.floor(totalPot / winners.length);
+
+    for (const w of winners) {
+      const player = session.players.get(w.playerId);
+      if (player) {
+        player.chips += winAmount;
+      }
+    }
+    return {
+      winners: winners.map((w) => ({ playerId: w.playerId, rank: w.rank })),
+      winAmount,
+    };
+  }
+
+  private broadcastResultAndChips(
+    session: Session,
+    winners: { playerId: string; rank: string }[],
+    winAmount: number
+  ): void {
     const resultEntries = winners.map((w) => ({
       playerId: w.playerId,
       winAmount,
       handRank: w.rank,
     }));
     const resultMsg = serializeResult(resultEntries);
-    session.players.forEach((p) => p.ws?.send(resultMsg));
-
-    // Update chips according to win amount
-    for (const w of winners) {
-      const player = session.players.get(w.playerId);
-      if (player) {
-        player.chips += winAmount;
-      }
+    for (const p of session.players.values()) {
+      p.ws?.send(resultMsg);
     }
     const chipsMsg = serializeChips(
       Array.from(session.players.values()).map((p) => ({
@@ -434,32 +500,39 @@ class GameService {
         chips: p.chips,
       }))
     );
-    session.players.forEach((p) => p.ws?.send(chipsMsg));
+    for (const p of session.players.values()) {
+      p.ws?.send(chipsMsg);
+    }
+  }
 
-    // Eliminate players with 0 chips
+  private eliminatePlayers(session: Session): void {
     let position = 1;
     for (const p of session.players.values()) {
-      if (p.chips <= 0) {
+      if (p.chips <= 0 && p.state !== PlayerState.Eliminated) {
         const elimMsg = serializeEliminated(p.id, position);
-        session.players.forEach((s) => s.ws?.send(elimMsg));
+        for (const s of session.players.values()) {
+          s.ws?.send(elimMsg);
+        }
         p.state = PlayerState.Eliminated;
         position++;
       }
     }
+  }
 
-    // If only one player remains with chips, end the match
+  private checkGameOver(session: Session): void {
     const alive = Array.from(session.players.values()).filter(
       (p) => p.chips > 0
     );
     if (alive.length === 1) {
       const overMsg = serializeGameOver(alive[0].id);
-      session.players.forEach((p) => p.ws?.send(overMsg));
+      for (const p of session.players.values()) {
+        p.ws?.send(overMsg);
+      }
       session.state = SessionState.Closed;
     }
   }
 
   private rankValue(rank: string): number {
-    // Simple ordering matching hand evaluator return values
     const order = [
       "NONE",
       "HIGH_CARD",

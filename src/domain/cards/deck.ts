@@ -1,4 +1,4 @@
-import type { Card, CardSuit, CardValue } from "./card";
+import type { Card, CardSuit, CardValue } from "@/domain/cards/card";
 
 const values: CardValue[] = [
   "2",

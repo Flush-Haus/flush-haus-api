@@ -1,5 +1,5 @@
-import { SessionState } from "../../utils/constants";
-import type { Player } from "../player/player";
+import type { Player } from "@/domain/player/player";
+import { SessionState } from "@/utils/constants";
 
 export class Session {
   id: string;

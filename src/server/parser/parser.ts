@@ -1,4 +1,4 @@
-import { tokenize } from "./tokenizer";
+import { tokenize } from "@/server/parser/tokenizer";
 
 export interface Command {
   action: string;

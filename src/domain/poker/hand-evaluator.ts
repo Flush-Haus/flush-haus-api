@@ -1,4 +1,4 @@
-import type { Card } from "../cards/card";
+import type { Card } from "@/domain/cards/card";
 
 export type HandRank =
   | "NONE"

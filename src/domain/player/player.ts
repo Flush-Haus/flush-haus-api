@@ -1,5 +1,10 @@
-import { PlayerState } from "../../utils/constants";
-import type { Card } from "../cards/card";
+import type { Card } from "@/domain/cards/card";
+import { PlayerState } from "@/utils/constants";
+
+export interface WS {
+  id: string;
+  send(data: string): void;
+}
 
 export class Player {
   holeCards: Card[] = [];
@@ -8,7 +13,7 @@ export class Player {
   name: string;
   chips: number;
   state: PlayerState;
-  ws?: any; // WebSocket connection, stored for sending messages
+  ws?: WS;
   seatPosition?: number;
 
   constructor(id: string, name: string, chips: number) {

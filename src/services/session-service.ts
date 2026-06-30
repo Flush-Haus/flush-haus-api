@@ -1,7 +1,8 @@
-import { Player } from "../domain/player/player";
-import { Session } from "../domain/session/session";
-import { PlayerState, SessionState } from "../utils/constants";
-import { generatePlayerId, generateSessionId } from "../utils/idGenerator";
+import type { WS } from "@/domain/player/player";
+import { Player } from "@/domain/player/player";
+import { Session } from "@/domain/session/session";
+import { PlayerState, SessionState } from "@/utils/constants";
+import { generatePlayerId, generateSessionId } from "@/utils/id-generator";
 
 class SessionService {
   private readonly sessions: Map<string, Session> = new Map();
@@ -9,7 +10,7 @@ class SessionService {
 
   createSession(
     ownerName: string,
-    ws: any
+    ws: WS
   ): { sessionId: string; playerId: string } {
     const sessionId = generateSessionId();
     const playerId = generatePlayerId();
@@ -18,6 +19,7 @@ class SessionService {
 
     const player = new Player(playerId, ownerName, 0);
     player.ws = ws;
+    player.seatPosition = 1;
     session.players.set(playerId, player);
     this.sessions.set(sessionId, session);
     this.playerToSession.set(playerId, sessionId);
@@ -39,7 +41,7 @@ class SessionService {
   joinSession(
     sessionId: string,
     playerName: string,
-    ws: any
+    ws: WS
   ): { playerId: string } | null {
     const session = this.sessions.get(sessionId);
     if (!session) {
@@ -57,12 +59,13 @@ class SessionService {
     const playerId = generatePlayerId();
     const player = new Player(playerId, playerName, session.startingChips);
     player.ws = ws;
+    player.seatPosition = session.players.size + 1;
     session.players.set(playerId, player);
     this.playerToSession.set(playerId, sessionId);
     return { playerId };
   }
 
-  reconnectPlayer(playerId: string, ws: any): boolean {
+  reconnectPlayer(playerId: string, ws: WS): boolean {
     const session = this.getSessionByPlayer(playerId);
     if (!session) {
       return false;
@@ -72,7 +75,6 @@ class SessionService {
       return false;
     }
     player.ws = ws;
-    // Restore state if previously disconnected
     if (player.state === PlayerState.Disconnected) {
       player.state = PlayerState.Connected;
     }
@@ -95,8 +97,9 @@ class SessionService {
     session.smallBlind = smallBlind;
     session.bigBlind = bigBlind;
     session.startingChips = startingChips;
-    // Initialize chips for all players
-    session.players.forEach((p) => (p.chips = startingChips));
+    for (const p of session.players.values()) {
+      p.chips = startingChips;
+    }
     session.state = SessionState.Running;
     return true;
   }
