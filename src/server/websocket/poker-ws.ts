@@ -12,7 +12,9 @@ import { gameService } from "@/services/game-service";
 import { sessionService } from "@/services/session-service";
 import { PlayerState } from "@/utils/constants";
 
-const wsToPlayer = new Map<WS, string>();
+// Map connection id -> player id. Keyed by ws.id because Elysia hands out a
+// fresh ws wrapper per event, so the object itself is not a stable Map key.
+const wsToPlayer = new Map<string, string>();
 
 function handleSessionCommand(
   ws: WS,
@@ -27,7 +29,7 @@ function handleSessionCommand(
         playerName,
         ws
       );
-      wsToPlayer.set(ws, playerId);
+      wsToPlayer.set(ws.id, playerId);
       ws.send(serializeSessionCreated(sessionId, playerId));
       ws.send(serializeOk(text));
       break;
@@ -36,7 +38,7 @@ function handleSessionCommand(
       const [sessionId, playerName] = params;
       const result = sessionService.joinSession(sessionId, playerName, ws);
       if (result) {
-        wsToPlayer.set(ws, result.playerId);
+        wsToPlayer.set(ws.id, result.playerId);
         ws.send(serializeSessionJoined(sessionId, result.playerId));
         ws.send(serializeOk(text));
       } else {
@@ -45,7 +47,7 @@ function handleSessionCommand(
       break;
     }
     case "info": {
-      const playerId = wsToPlayer.get(ws);
+      const playerId = wsToPlayer.get(ws.id);
       if (!playerId) {
         ws.send(serializeError(text, "ERR_PLAYER_NOT_IN_SESSION", []));
         break;
@@ -70,11 +72,43 @@ function handleSessionCommand(
       }
       break;
     }
+    case "start": {
+      const playerId = wsToPlayer.get(ws.id);
+      const session = playerId
+        ? sessionService.getSessionByPlayer(playerId)
+        : undefined;
+      if (!(session && session.ownerId === playerId)) {
+        ws.send(serializeError(text, "ERR_NOT_OWNER", []));
+        break;
+      }
+      const [sb, bb, chips] = params.map(Number);
+      const ok = sessionService.startSession(
+        session.id,
+        sb || 0,
+        bb || 0,
+        chips || 0
+      );
+      if (!ok) {
+        ws.send(serializeError(text, "ERR_INVALID_STATE", []));
+        break;
+      }
+      const started = `session started ${sb} ${bb} ${chips}`;
+      for (const p of session.players.values()) {
+        p.ws?.send(started);
+      }
+      ws.send(serializeOk(text));
+      break;
+    }
+    case "ping": {
+      const [clientMs] = params;
+      ws.send(`session pong ${clientMs} ${Date.now()}`);
+      break;
+    }
     case "reconnect": {
       const [reconnectId] = params;
       const ok = sessionService.reconnectPlayer(reconnectId, ws);
       if (ok) {
-        wsToPlayer.set(ws, reconnectId);
+        wsToPlayer.set(ws.id, reconnectId);
         ws.send(serializeOk(text));
         // Send current session and game state to reconnected client
         const session = sessionService.getSessionByPlayer(reconnectId);
@@ -142,7 +176,7 @@ export const pokerWs: WSHandler = {
   },
   close(ws) {
     console.log("WebSocket connection closed", ws.id);
-    const playerId = wsToPlayer.get(ws);
+    const playerId = wsToPlayer.get(ws.id);
     if (playerId) {
       const session = sessionService.getSessionByPlayer(playerId);
       if (session) {
@@ -152,7 +186,7 @@ export const pokerWs: WSHandler = {
         }
       }
     }
-    wsToPlayer.delete(ws);
+    wsToPlayer.delete(ws.id);
   },
   message(ws, message) {
     const text = typeof message === "string" ? message : "";
@@ -162,7 +196,7 @@ export const pokerWs: WSHandler = {
       return;
     }
     const { domain, action, params } = cmd;
-    const playerId = wsToPlayer.get(ws);
+    const playerId = wsToPlayer.get(ws.id);
 
     try {
       if (domain === "session") {
